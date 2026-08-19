@@ -277,6 +277,16 @@ if (location.protocol === "file:") {
 </script>
 <video id="cam" autoplay playsinline muted></video>
 <div id="behind"></div>
+<a id="tab-btn" href="#" target="_blank" style="display:none;position:absolute;top:12px;right:12px;z-index:999;padding:6px 12px;background:rgba(14,40,36,0.7);border:1px solid rgba(111,229,214,0.5);border-radius:6px;color:#8ff0e4;font:12px 'SF Mono',Menlo,monospace;text-decoration:none;letter-spacing:0.04em;">Open in New Tab ↗</a>
+<script>
+if (window.self !== window.top) {
+  const tb = document.getElementById("tab-btn");
+  if (tb) {
+    tb.href = location.href;
+    tb.style.display = "block";
+  }
+}
+</script>
 <div id="boot">BAREHANDS<br><span style="color:#a8d8cf;font-size:12px;letter-spacing:0.22em">by jaredrhod</span><br><span style="color:#a8d8cf;font-size:13px">loading hand tracker… allow the camera when asked</span></div>
 <div id="hint">tap the RING = orbs · tap an orb = its tree · TAP a card = open · pinch-drag = move · hold still ~1s = 3D rotate · two hands = scale · TAP an open item = close · CLAP (palms together, fingers up) = ring center-stage · CLAW: flash open, claw, aim, hold the strain 2s, SNAP = force pull · empty pinch dragged sideways = explode scrub · R respawn / C camera / D debug</div>
 <div id="debug"></div>
@@ -1520,40 +1530,79 @@ function toast(msg, ms = 2500) {
 let camDevices = [], camIdx = -1;
 
 async function startCam(deviceId) {
-  if (cam.srcObject) cam.srcObject.getTracks().forEach(t => t.stop());
+  if (cam.srcObject) {
+    try { cam.srcObject.getTracks().forEach(t => t.stop()); } catch (e) {}
+  }
+  cam.muted = true;
+  cam.playsInline = true;
   const IW = PORTRAIT ? Math.min(...RES) : Math.max(...RES);
   const IH = PORTRAIT ? Math.max(...RES) : Math.min(...RES);
-  const video = { width: { ideal: IW }, height: { ideal: IH } };
-  if (deviceId) video.deviceId = { exact: deviceId };
   let stream = null;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
-  } catch (e) {
-    // THE RESILIENT BOOT (2026-08-13 night — the tracking camera
-    // powered down off the bus and the failed default request bricked
-    // the ENTIRE stage boot): one dead camera must never kill the
-    // show. Fall through every camera the OS still offers and take
-    // the first that opens; only die if NONE do. C still cycles.
-    const devs = (await navigator.mediaDevices.enumerateDevices())
-      .filter(d => d.kind === "videoinput");
-    for (const d of devs) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: d.deviceId },
-                   width: { ideal: IW }, height: { ideal: IH } },
-          audio: false });
-        break;
-      } catch (e2) {}
-    }
-    if (!stream) throw e;
+  
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Camera API (navigator.mediaDevices.getUserMedia) is not available in this browser context. Please open the app in a new tab.");
   }
+
+  const tryGetStream = async (constraints) => {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+      return null;
+    }
+  };
+
+  if (deviceId) {
+    stream = await tryGetStream({ video: { deviceId: { exact: deviceId }, width: { ideal: IW }, height: { ideal: IH } }, audio: false }) ||
+             await tryGetStream({ video: { deviceId: { exact: deviceId } }, audio: false });
+  }
+
+  if (!stream) {
+    stream = await tryGetStream({ video: { width: { ideal: IW }, height: { ideal: IH } }, audio: false }) ||
+             await tryGetStream({ video: true, audio: false });
+  }
+
+  if (!stream && navigator.mediaDevices.enumerateDevices) {
+    try {
+      const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+      for (const d of devs) {
+        stream = await tryGetStream({ video: { deviceId: { exact: d.deviceId } }, audio: false });
+        if (stream) break;
+      }
+    } catch (e) {}
+  }
+
+  if (!stream) {
+    throw new Error("Could not access any camera stream. Please verify camera permissions or open in a new tab.");
+  }
+
   cam.srcObject = stream;
-  await new Promise(r => cam.onloadedmetadata = r);
-  camDevices = (await navigator.mediaDevices.enumerateDevices())
-    .filter(d => d.kind === "videoinput");
-  const live = stream.getVideoTracks()[0];
-  camIdx = camDevices.findIndex(d => d.label === live.label);
-  toast(`camera: ${live.label || "default"}`);
+  try {
+    await cam.play();
+  } catch (e) {
+    console.warn("Video playback autoplay notice:", e);
+  }
+
+  await new Promise(resolve => {
+    if (cam.readyState >= 1) {
+      resolve();
+    } else {
+      let resolved = false;
+      const done = () => { if (!resolved) { resolved = true; resolve(); } };
+      cam.onloadedmetadata = done;
+      cam.onloadeddata = done;
+      cam.oncanplay = done;
+      setTimeout(done, 1200);
+    }
+  });
+
+  try {
+    camDevices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    const live = stream.getVideoTracks()[0];
+    if (live) {
+      camIdx = camDevices.findIndex(d => d.label === live.label);
+      toast(`camera: ${live.label || "default"}`);
+    }
+  } catch (e) {}
 }
 
 async function pickInitialCam() {
@@ -2005,24 +2054,35 @@ async function boot() {
   await pickInitialCam();
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-  landmarker = await HandLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath:
-      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate: "GPU" },
-    numHands: 2, runningMode: "VIDEO",
-    // phantom-hand filter (a real-room catch: debug showed a hand with
-    // none in frame — a busy background is full of hand-shaped clutter
-    // and the 0.5 defaults hallucinate there; a ghost hand can grab items
-    // and false-trigger gestures). 0.65 helped but the ghost
-    // survived → 0.7. Ease back toward 0.65 if real-hand pickup ever
-    // feels laggy; past 0.75 real tracking suffers.
+  
+  const options = {
+    numHands: 2,
+    runningMode: "VIDEO",
     minHandDetectionConfidence: 0.7,
-    // v3.9.9 (his blur diagnosis: fast hands smear and get DROPPED,
-    // and re-acquisition eats the frames that felt like grab-lag):
-    // KEEP-tracking eased to 0.5 so a latched hand rides through blur;
-    // fresh DETECTION stays 0.7 — the busy-background ghost wall holds.
-    minHandPresenceConfidence: 0.5 });
-  document.getElementById("boot").remove();
+    minHandPresenceConfidence: 0.5
+  };
+
+  try {
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      ...options,
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      }
+    });
+  } catch (gpuErr) {
+    console.warn("GPU delegate failed, falling back to CPU:", gpuErr);
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      ...options,
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "CPU"
+      }
+    });
+  }
+
+  const bootEl = document.getElementById("boot");
+  if (bootEl) bootEl.remove();
   await loadTree();
   spawnStage();
   toast("barehands v1.0", 2000);  // build fingerprint
@@ -3094,8 +3154,24 @@ if (ROLE === "render") {
   renderLoop();
 } else {
   boot().catch(e => {
-    document.getElementById("boot").innerHTML =
-      `STAGE FAILED TO BOOT<br><span style="color:#ff6666;font-size:13px">${e.message}</span>`;
+    console.error("Boot error:", e);
+    const bootEl = document.getElementById("boot");
+    if (bootEl) {
+      bootEl.innerHTML = `
+        <div style="max-width:540px;padding:24px;background:rgba(5,20,20,0.92);border:1.5px solid rgba(255,100,100,0.8);border-radius:12px;color:#ffcccc;text-align:left;box-shadow:0 12px 40px rgba(0,0,0,0.8);">
+          <div style="font-size:18px;font-weight:700;color:#ff7777;margin-bottom:10px;font-family:'SF Mono',Menlo,monospace;letter-spacing:0.06em;">CAMERA / TRACKER FAILED TO START</div>
+          <div style="font-size:13px;color:#fce4e4;line-height:1.6;font-family:sans-serif;margin-bottom:14px;">${e.message || e}</div>
+          <div style="font-size:12.5px;color:#8ff0e4;background:rgba(14,40,36,0.8);padding:10px 12px;border-radius:8px;border:1px solid rgba(111,229,214,0.3);line-height:1.5;font-family:sans-serif;margin-bottom:16px;">
+            <b>Why is this happening?</b> Browsers restrict camera and MediaPipe hardware access inside embedded iframes. Opening the app directly in its own browser tab provides full hardware camera permissions.
+          </div>
+          <div style="text-align:center;">
+            <a href="${location.href}" target="_blank" style="display:inline-block;padding:10px 20px;background:#14484f;color:#8ff0e4;border:1.5px solid #6fe3c9;border-radius:8px;text-decoration:none;font-weight:700;font-size:13.5px;font-family:'SF Mono',Menlo,monospace;letter-spacing:0.05em;cursor:pointer;">
+              OPEN IN NEW TAB ↗
+            </a>
+          </div>
+        </div>
+      `;
+    }
   });
 }
 </script>
